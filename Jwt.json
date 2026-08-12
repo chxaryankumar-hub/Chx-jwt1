@@ -1,0 +1,50 @@
+{
+  "project": "ff-jwt-api",
+  "description": "Free Fire MAX guest uid+password -> JWT token (FastAPI, Vercel-ready)",
+  "files": {
+    "requirements.txt": "fastapi==0.115.0\nuvicorn[standard]==0.30.6\nhttpx==0.27.2\nprotobuf==6.30.0\npycryptodome==3.20.0\npydantic==2.9.2",
+    "vercel.json": "{\n  \"$schema\": \"https://openapi.vercel.sh/vercel.json\",\n  \"functions\": {\n    \"app/main.py\": {\n      \"maxDuration\": 60\n    }\n  }\n}",
+    ".python-version": "3.12",
+    ".vercelignore": ".git/\ntests/\n*.md",
+    "app/__init__.py": "",
+    "app/settings.py": "import base64\nimport os\nfrom pydantic import BaseModel\n\n\nclass Settings(BaseModel):\n    MAIN_KEY_B64: str = os.getenv(\"MAIN_KEY_B64\", \"WWcmdGMlREV1aDYlWmNeOA==\")\n    MAIN_IV_B64: str = os.getenv(\"MAIN_IV_B64\", \"Nm95WkRyMjJFM3ljaGpNJQ==\")\n    RELEASE_VERSION: str = os.getenv(\"RELEASE_VERSION\", \"OB51\")\n    USER_AGENT: str = os.getenv(\"USER_AGENT\", \"GarenaMSDK/4.0.19P10(I2404 ;Android 15;en;US;)\")\n    OAUTH_URL: str = os.getenv(\"OAUTH_URL\", \"https://ffmconnect.live.gop.garenanow.com/api/v2/oauth/guest/token:grant\")\n    MAJOR_LOGIN_URL: str = os.getenv(\"MAJOR_LOGIN_URL\", \"https://loginbp.ggwhitehawk.com/MajorLogin\")\n    CLIENT_SECRET_PAYLOAD: str = os.getenv(\n        \"CLIENT_SECRET_PAYLOAD\",\n        \"2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067\",\n    )\n    X_UNITY_VERSION: str = os.getenv(\"X_UNITY_VERSION\", \"2018.4.11f1\")\n    TIMEOUT: float = 10.0\n\n    @property\n    def MAIN_KEY(self) -> bytes:\n        return base64.b64decode(self.MAIN_KEY_B64)\n\n    @property\n    def MAIN_IV(self) -> bytes:\n        return base64.b64decode(self.MAIN_IV_B64)\n\n\nsettings = Settings()",
+    "app/core.py": "import json\nfrom typing import Dict, Tuple\n\nimport httpx\nfrom Crypto.Cipher import AES\nfrom google.protobuf import json_format\n\nfrom app.settings import settings\nfrom ff_proto import freefire_pb2\n\n\ndef pkcs7_pad(b: bytes, block_size: int = 16) -> bytes:\n    pad_len = block_size - (len(b) % block_size)\n    return b + bytes([pad_len]) * pad_len\n\n\ndef aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:\n    cipher = AES.new(key, AES.MODE_CBC, iv)\n    return cipher.encrypt(pkcs7_pad(plaintext, 16))\n\n\ndef json_to_proto(json_data: dict, proto_msg) -> bytes:\n    json_format.ParseDict(json_data, proto_msg)\n    return proto_msg.SerializeToString()\n\n\nasync def get_access_token(client: httpx.AsyncClient, uid: str, password: str) -> Tuple[str, str]:\n    parts = settings.CLIENT_SECRET_PAYLOAD.split('&client_id=')\n    client_secret = parts[0]\n    client_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 100067\n\n    payload = {\n        \"client_id\": client_id,\n        \"client_secret\": client_secret,\n        \"client_type\": 2,\n        \"password\": password,\n        \"response_type\": \"token\",\n        \"uid\": int(uid),\n    }\n    headers = {\n        \"User-Agent\": settings.USER_AGENT,\n        \"Accept\": \"application/json\",\n        \"Content-Type\": \"application/json; charset=utf-8\",\n        \"Connection\": \"Keep-Alive\",\n        \"Accept-Encoding\": \"gzip\",\n    }\n    r = await client.post(settings.OAUTH_URL, json=payload, headers=headers, timeout=settings.TIMEOUT)\n    r.raise_for_status()\n    data = r.json().get(\"data\", {})\n    if \"error\" in data:\n        raise ValueError(f\"Garena API error: {data.get('error_description', data['error'])}\")\n    return data.get(\"access_token\", \"0\"), data.get(\"open_id\", \"0\")\n\n\nasync def create_jwt(uid: str, password: str) -> Dict[str, str]:\n    async with httpx.AsyncClient(http2=False) as client:\n        access_token, open_id = await get_access_token(client, uid, password)\n        if access_token == \"0\":\n            raise ValueError(\"Failed to obtain access token - wrong guest id/password?\")\n\n        login_req = {\n            \"open_id\": open_id,\n            \"open_id_type\": \"4\",\n            \"login_token\": access_token,\n            \"orign_platform_type\": \"4\",\n        }\n        req_msg = freefire_pb2.LoginReq()\n        encoded = json_to_proto(login_req, req_msg)\n        encrypted_payload = aes_cbc_encrypt(settings.MAIN_KEY, settings.MAIN_IV, encoded)\n\n        headers = {\n            \"User-Agent\": \"Dalvik/2.1.0 (Linux; U; Android 15; I2404 Build/AP3A.240905.015.A2_V000L1)\",\n            \"Connection\": \"Keep-Alive\",\n            \"Accept-Encoding\": \"gzip\",\n            \"Content-Type\": \"application/octet-stream\",\n            \"Expect\": \"100-continue\",\n            \"X-Unity-Version\": settings.X_UNITY_VERSION,\n            \"X-GA\": \"v1 1\",\n            \"ReleaseVersion\": settings.RELEASE_VERSION,\n        }\n        r = await client.post(\n            settings.MAJOR_LOGIN_URL,\n            content=encrypted_payload,\n            headers=headers,\n            timeout=settings.TIMEOUT,\n        )\n        r.raise_for_status()\n\n        res_msg = freefire_pb2.LoginRes()\n        res_msg.ParseFromString(r.content)\n        token = res_msg.token\n        if not token:\n            raise ValueError(f\"MajorLogin failed: {res_msg}\")\n        return {\n            \"token\": token,\n            \"lockRegion\": res_msg.lock_region,\n            \"serverUrl\": res_msg.server_url,\n        }",
+    "app/main.py": "from fastapi import FastAPI, HTTPException, Query, Body\nfrom pydantic import BaseModel\n\nfrom app.core import create_jwt\n\napp = FastAPI(title=\"FF MAX Guest -> JWT API\", version=\"1.0.0\")\n\n\nclass TokenRequest(BaseModel):\n    uid: str\n    password: str\n\n\n@app.get(\"/\")\nasync def root():\n    return {\"message\": \"Use POST /api/token (JSON) ya GET /api/token?uid=...&password=...\"}\n\n\n@app.get(\"/api/token\")\nasync def get_token(uid: str = Query(...), password: str = Query(...)):\n    try:\n        return await create_jwt(uid, password)\n    except ValueError as e:\n        raise HTTPException(status_code=401, detail=str(e))\n    except Exception as e:\n        raise HTTPException(status_code=500, detail=str(e))\n\n\n@app.post(\"/api/token\")\nasync def post_token(payload: TokenRequest = Body(...)):\n    try:\n        return await create_jwt(payload.uid, payload.password)\n    except ValueError as e:\n        raise HTTPException(status_code=401, detail=str(e))\n    except Exception as e:\n        raise HTTPException(status_code=500, detail=str(e))",
+    "ff_proto/__init__.py": "",
+    "ff_proto/freefire.proto": "syntax = \"proto3\";\n\nmessage LoginReq {\n  string open_id = 1;\n  string open_id_type = 2;\n  string login_token = 3;\n  string orign_platform_type = 4;\n}\n\nmessage LoginRes {\n  string token = 1;\n  string lock_region = 2;\n  string server_url = 3;\n}"
+  },
+  "build_notes": {
+    "protobuf_generate": "protoc --python_out=ff_proto ff_proto/freefire.proto (generated freefire_pb2.py ko repo mein commit karna zaroori hai - Vercel build pe protoc nahi chalega)",
+    "deploy": "npm i -g vercel && vercel login && vercel dev (test) && vercel --prod",
+    "env_vars_optional": ["MAIN_KEY_B64", "MAIN_IV_B64", "CLIENT_SECRET_PAYLOAD", "RELEASE_VERSION", "OAUTH_URL", "MAJOR_LOGIN_URL", "USER_AGENT"]
+  },
+  "api_contract": {
+    "base_url": "https://<tuna-app>.vercel.app",
+    "endpoints": [
+      {
+        "method": "POST",
+        "path": "/api/token",
+        "description": "Guest uid+password se JWT generate (recommended)",
+        "headers": { "Content-Type": "application/json" },
+        "request_body": { "uid": "4104181280", "password": "6485A0BBC486BFE8CF065F14D45F9CDAB5BE5D7F2A5998A6A7CABB295BA5F31A" },
+        "responses": {
+          "200_success": { "token": "<JWT>", "lockRegion": "IND", "serverUrl": "https://..." },
+          "401_invalid_credentials": { "detail": "Failed to obtain access token - wrong guest id/password?" },
+          "500_server_error": { "detail": "<error_message>" }
+        }
+      },
+      {
+        "method": "GET",
+        "path": "/api/token?uid=4104181280&password=6485A0BBC486BFE8CF065F14D45F9CDAB5BE5D7F2A5998A6A7CABB295BA5F31A",
+        "description": "Quick testing ke liye (credentials URL mein - sirf local test)",
+        "responses": {
+          "200_success": { "token": "<JWT>", "lockRegion": "IND", "serverUrl": "https://..." }
+        }
+      }
+    ],
+    "extra": {
+      "swagger_ui": "GET /docs",
+      "health_check": "GET /"
+    }
+  }
+}
